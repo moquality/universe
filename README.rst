@@ -89,7 +89,7 @@ On Ubuntu 14.04:
 
     sudo add-apt-repository ppa:ubuntu-lxc/lxd-stable  # for newer golang
     sudo apt-get update
-    apt-get install golang libjpeg-turbo8-dev make
+    sudo apt-get install golang libjpeg-turbo8-dev make
 
 On OSX:
 
@@ -99,11 +99,11 @@ You might need to install Command Line Tools by running:
 
     xcode-select --install
 
-Or ``numpy`` and ``libjpeg-turbo`` packages:
+Or ``numpy``, ``libjpeg-turbo`` and ``incremental`` packages:
 
 .. code:: shell
 
-    pip install numpy
+    pip install numpy incremental
     brew install golang libjpeg-turbo
 
 Install Docker
@@ -160,7 +160,7 @@ The code in this repository corresponds to the **client** side of the
 Universe environments. Additionally, you can freely access the Docker
 images for the **remotes**. We'll release the source repositories for
 the remotes in the future, along with tools to enable users to
-integrate new environments in the future. Please sign up for our `beta
+integrate new environments. Please sign up for our `beta
 <https://docs.google.com/forms/d/e/1FAIpQLScAiW-kIS0mz6hdzzFZJJFlXlicDvQs1TX9XMEkipNwjV5VlA/viewform>`_
 if you'd like early access.
 
@@ -218,7 +218,7 @@ IP address of your Docker daemon, and use ``openai`` as the password.)
 Breaking down the example
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-So we managed to run an agent, but what did all the code actually
+So we managed to run an agent, what did all the code actually
 mean? We'll go line-by-line through the example.
 
 * First, we import the `gym <https://github.com/openai/gym>`__ library,
@@ -263,7 +263,7 @@ mean? We'll go line-by-line through the example.
   environments run in real-time, rather than stepping synchronously
   with the agent's actions, so ``reset`` is asynchronous and returns
   immediately. Since the environment will not have waited to finish
-  connecting to the VNC server before returning, the initial observations 
+  connecting to the VNC server before returning, the initial observations
   from ``reset`` will be ``None`` to indicate that there is
   not yet a valid observation.
 
@@ -349,6 +349,24 @@ Additional documentation
 More documentation not covered in this README can be found in the
 `doc folder <doc>`__ of this repository.
 
+Getting help
+============
+
+If you encounter a problem that is not addressed in this README page
+or in the `extra docs <doc>`__, then try our wiki page of `solutions
+to common problems
+<https://github.com/openai/universe/wiki/Solutions-to-common-problems>`__ -
+and add to it if your solution isn't there!
+
+You can also search through the `issues
+<https://github.com/openai/universe/issues?utf8=%E2%9C%93&q=is%3Aissue>`__
+on this repository and our `discussion board
+<https://discuss.openai.com/c/Universe>`__ to see if another user has posted
+about the same problem or to ask for help from the community.
+
+If you still can't solve your problem after trying all of the above
+steps, please post an issue on this repository.
+
 What's next?
 ============
 
@@ -357,3 +375,14 @@ What's next?
 * For more information on how to manage remotes, see the separate documentation page on `remotes <doc/remotes.rst>`__.
 
 * Sign up for a `beta <https://docs.google.com/forms/d/e/1FAIpQLScAiW-kIS0mz6hdzzFZJJFlXlicDvQs1TX9XMEkipNwjV5VlA/viewform>`_ to get early access to upcoming Universe releases, such as tools to integrate new Universe environments or a dataset of recorded human demonstrations.
+
+
+Changelog
+---------
+- 2017-02-08: The old location for wrappers.SafeActionSpace has been moved to wrappers.experimental.SafeActionSpace. SoftmaxClickMouse has also been moved to wrappers.experimental.SoftmaxClickMouse
+- 2017-01-08: The wrappers.SafeActionSpace has been moved to wrappers.experimental.SafeActionSpace. The old location will remain with a deprecation warning until 2017-02-08.
+- 2016-12-27: BACKWARDS INCOMPATIBILITY: The gym monitor is now a
+  wrapper. Rather than starting monitoring as
+  `env.monitor.start(directory)`, envs are now wrapped as follows:
+  `env = wrappers.Monitor(env, directory)`. This change is on master
+  and will be released with 0.21.0.

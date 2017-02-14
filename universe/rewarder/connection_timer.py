@@ -1,12 +1,11 @@
 import os
-import random
 import re
 import signal
 import time
 
 from universe import error
 from universe.twisty import reactor
-from twisted.internet import defer, protocol, task
+from twisted.internet import defer, protocol
 import twisted.internet.error
 import logging
 
@@ -17,45 +16,11 @@ class ConnectionTimer(protocol.Protocol):
     def connectionMade(self):
         self.transport.loseConnection()
 
-def connection_timer_factory():
-    factory = protocol.ClientFactory()
-    factory.protocol = ConnectionTimer
-    return factory
-
-class StopWatch(object):
-    def start(self):
-        self.start_time = time.time()
-
-    def stop(self):
-        return time.time() - self.start_time
-
-# TODO: clean this up
-def start(endpoint, max_attempts=0):
-    # Use an object for timing so that we can mutate it within the closure
-    stop_watch = StopWatch()
-
-    def success(client):
-        return stop_watch.stop()
-
-    def error(failure, retry):
-        # some websocket implementations (like websocketcpp) can fail when connections are lost too quickly
-        if retry == 0:
-            raise ConnectionTimerException("Max retries")
-        backoff = 2 ** (max_attempts - retry + 1) + random.randint(42, 100)
-        logger.info('Throttling down websocket creation after connection error (this is normal) - waiting %dms - '
-                    'error details %s', backoff, error)
-        d = task.deferLater(reactor, backoff / 1000., go, retry - 1)
-        return d
-
-    def go(retry):
-        stop_watch.start()
-        factory = connection_timer_factory()
-        d = endpoint.connect(factory)
-        d.addCallback(success)
-        d.addErrback(error, retry)
-        return d
-
-    return go(retry=max_attempts)
+def start(endpoint):
+    start = time.time()
+    return endpoint.connect(
+        protocol.ClientFactory.forProtocol(ConnectionTimer)
+    ).addCallback(lambda _: time.time() - start)
 
 def measure_clock_skew(label, host):
     cmd = ['ntpdate', '-q', '-p', '8', host]

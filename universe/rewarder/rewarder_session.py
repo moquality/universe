@@ -5,10 +5,10 @@ import threading
 import time
 
 from twisted.python import failure
-from twisted.internet import defer, endpoints, task
+from twisted.internet import defer, endpoints
 import twisted.internet.error
 
-from universe import error, utils
+from universe import utils
 from universe.twisty import reactor
 from universe.rewarder import connection_timer, env_status, reward_buffer, rewarder_client
 from universe.utils import display
@@ -34,7 +34,7 @@ class RewarderSession(object):
 
         self.clients = {}
 
-    def close(self, name=None):
+    def close(self, name=None, reason=u'closed by RewarderSession.close'):
         if name is None:
             names = list(self.names_by_id.values())
         else:
@@ -59,12 +59,12 @@ class RewarderSession(object):
 
                 client = self.clients.pop(id, None)
                 if client is not None:
-                    reactor.callFromThread(client.close)
+                    reactor.callFromThread(client.close, reason=reason)
 
     def connect(self, name, address, label, password, env_id=None, seed=None, fps=60,
                 start_timeout=None, observer=False, skip_network_calibration=False):
         if name in self.reward_buffers:
-            self.close(name)
+            self.close(name, reason='closing previous connection to reconnect with the same name')
 
         network = Network()
         self.names_by_id[self.i] = name
@@ -98,6 +98,7 @@ class RewarderSession(object):
     # Call only from Twisted thread
 
     # TODO: probably time to convert to kwargs
+    @defer.inlineCallbacks
     def _connect(self, name, address, env_id, seed, fps, i, network, env_status, reward_buffer,
                  label, password, start_timeout,
                  observer, skip_network_calibration,
@@ -133,16 +134,22 @@ class RewarderSession(object):
                 # drop error on the floor if we're already closed
                 if self._already_closed(factory.i):
                     extra_logger.info('[%s] Ignoring error for already closed connection: %s', label, e)
+                elif factory.i not in self.clients:
+                    extra_logger.info('[%s] Received error for connection which has not been fully initialized: %s', label, e)
+                    # We could handle this better, but right now we
+                    # just mark this as a fatal error for the
+                    # backend. Often it actually is.
+                    self.errors[factory.i] = e
                 else:
                     extra_logger.info('[%s] Recording fatal error for connection: %s', label, e)
                     self.errors[factory.i] = e
 
-        def websocket_failed(e):
+        def retriable_error(e, error_message):
             if isinstance(e, failure.Failure):
                 e = e.value
 
             if self._already_closed(factory.i):
-                logger.error('[%s] Giving up on reconnecting, since %d already disconnected', factory.label, factory.i)
+                logger.error('[%s] Got error, but giving up on reconnecting, since %d already disconnected', factory.label, factory.i)
                 return
 
             # Also need to handle DNS errors, so let's just handle everything for now.
@@ -150,7 +157,7 @@ class RewarderSession(object):
             # reason.trap(twisted.internet.error.ConnectError, error.ConnectionError)
             if elapsed_sleep_time < start_timeout:
                 sleep = min((2 * attempt+1), 10)
-                logger.error('[%s] Waiting on rewarder: %s. Retry in %ds (slept %ds/%ds): %s', factory.label, websocket_failed.error_message, sleep, elapsed_sleep_time, start_timeout, e)
+                logger.error('[%s] Waiting on rewarder: %s. Retry in %ds (slept %ds/%ds): %s', factory.label, error_message, sleep, elapsed_sleep_time, start_timeout, e)
                 reactor.callLater(
                     sleep, self._connect, name=name, address=address,
                     env_id=env_id, seed=seed, fps=fps, i=i, network=network,
@@ -160,104 +167,56 @@ class RewarderSession(object):
                     observer=observer, skip_network_calibration=skip_network_calibration,
                 )
             else:
-                logger.error('[%s] %s. Retries exceeded (slept %ds/%ds): %s', factory.label, websocket_failed.error_message, elapsed_sleep_time, start_timeout, e)
+                logger.error('[%s] %s. Retries exceeded (slept %ds/%ds): %s', factory.label, error_message, elapsed_sleep_time, start_timeout, e)
                 record_error(e)
 
-        def retriable_record_error(e):
-            """Record an error, unless our connection is still establishing"""
-            if isinstance(e, failure.Failure):
-                e = e.value
+        factory.record_error = record_error
 
-            # logger.error('[%s] Recording rewarder error: %s', factory.label, e)
-            with self.lock:
-                # drop error on the floor if we're already closed
-                if factory.i not in self.names_by_id:
-                    record_error(e)
-                elif factory.i not in self.clients:
-                    extra_logger.info('[%s] Received error for connection which has not been fully initialized: %s', label, e)
-                    # We could handle this better, but right now we
-                    # just mark this as a fatal error for the
-                    # backend. Often it actually is.
-                    #
-                    # If we break again, don't recurse; just skip to
-                    # the direct error recording.
-                    record_error(e)
-                else:
-                    record_error(e)
-        factory.record_error = retriable_record_error
+        try:
+            retry_msg = 'establish rewarder TCP connection'
+            client = yield endpoint.connect(factory)
+            extra_logger.info('[%s] Rewarder TCP connection established', factory.label)
 
-        def fail(reason):
-            factory.record_error(reason)
-
-        def connected(client):
+            retry_msg = 'complete WebSocket handshake'
+            yield client.waitForWebsocketConnection()
             extra_logger.info('[%s] Websocket client successfully connected', factory.label)
 
-            # Websocket client has come up fully. Time to start on the
-            # next level of our callback chain. (There must be a
-            # better way to write this.)
-            def calibrate_success(network):
+            if not skip_network_calibration:
+                retry_msg = 'run network calibration'
+                yield network.calibrate(client)
                 extra_logger.info('[%s] Network calibration complete', factory.label)
 
-                def reset_success(reply):
-                    # We're connected and have measured the
-                    # network. Mark everything as ready to go.
-                    with self.lock:
-                        if factory.i not in self.names_by_id:
-                            # ID has been popped!
-                            logger.info('[%s] Rewarder %d started, but has already been closed', factory.label, factory.i)
-                            client.close()
-                        elif reply is None:
-                            logger.info('[%s] Attached to running environment without reset', factory.label)
-                        else:
-                            context, req, rep = reply
-                            logger.info('[%s] Initial reset complete: episode_id=%s', factory.label, rep['headers']['episode_id'])
-                        self.clients[factory.i] = client
+            retry_msg = ''
 
-
-                if factory.arg_env_id is not None:
-                    # We aren't picky about episode ID: we may have
-                    # already receieved an env.describe message
-                    # telling us about a resetting environment, which
-                    # we don't need to bump post.
-                    #
-                    # tl;dr hardcoding 0.0 here avoids a double reset.
-                    d = self._send_env_reset(client, seed=seed, episode_id='0')
-                    d.addCallback(reset_success)
-                    d.addErrback(fail)
-                else:
-                    # No env_id requested, so we just proceed without a reset
-                    reset_success(None)
-
-            if skip_network_calibration:
-                calibrate_success(network)
+            if factory.arg_env_id is not None:
+                # We aren't picky about episode ID: we may have
+                # already receieved an env.describe message
+                # telling us about a resetting environment, which
+                # we don't need to bump post.
+                #
+                # tl;dr hardcoding 0.0 here avoids a double reset.
+                reply = yield self._send_env_reset(client, seed=seed, episode_id='0')
             else:
-                d = network.calibrate(client)
-                d.addCallback(calibrate_success)
-                websocket_failed.error_message = 'WebSocket handshake established but calibration failed'
-                d.addErrback(websocket_failed)
-                d.addErrback(fail)
-
-        d = defer.Deferred()
-        d.addCallbacks(connected)
-        websocket_failed.error_message = 'TCP connection established but WebSocket handshake failed'
-        d.addErrback(websocket_failed)
-        d.addErrback(fail)
-        factory.deferred = d
-
-        def connection_succeeded(conn):
-            extra_logger.info('[%s] Rewarder TCP connection established', factory.label)
-        def connection_failed(reason):
-            reason = error.Error('[{}] Connection failed: {}'.format(factory.label, reason.value))
-
-            try:
-                d.errback(utils.format_error(reason))
-            except defer.AlreadyCalledError:
-                raise
-        res = endpoint.connect(factory)
-        res.addCallback(connection_succeeded)
-        websocket_failed.error_message = 'Could not establish rewarder TCP connection'
-        res.addErrback(websocket_failed)
-        res.addErrback(connection_failed)
+                # No env_id requested, so we just proceed without a reset
+                reply = None
+            # We're connected and have measured the
+            # network. Mark everything as ready to go.
+            with self.lock:
+                if factory.i not in self.names_by_id:
+                    # ID has been popped!
+                    logger.info('[%s] Rewarder %d started, but has already been closed', factory.label, factory.i)
+                    client.close(reason='RewarderSession: double-closing, client was closed while RewarderSession was starting')
+                elif reply is None:
+                    logger.info('[%s] Attached to running environment without reset', factory.label)
+                else:
+                    context, req, rep = reply
+                    logger.info('[%s] Initial reset complete: episode_id=%s', factory.label, rep['headers']['episode_id'])
+                self.clients[factory.i] = client
+        except Exception as e:
+            if retry_msg:
+                retriable_error(e, 'failed to ' + retry_msg)
+            else:
+                record_error(e)
 
     def pop_errors(self):
         errors = {}
@@ -292,15 +251,11 @@ class RewarderSession(object):
         if episode_id is None:
             episode_id = client.factory.env_status.episode_id
         logger.info('[%s] Sending reset for env_id=%s fps=%s episode_id=%s', client.factory.label, client.factory.arg_env_id, client.factory.arg_fps, episode_id)
-        d = client.send_reset(
+        return client.send_reset(
             env_id=client.factory.arg_env_id,
             seed=seed,
             fps=client.factory.arg_fps,
             episode_id=episode_id)
-        def fail(reason):
-            client.factory.record_error(reason)
-        d.addErrback(fail)
-        return d
 
     def pop(self, warn=True, peek_d=None):
         reward_d = {}
@@ -384,8 +339,6 @@ class Network(object):
 
         self._ntpdate_reversed_clock_skew = None
         self._reversed_clock_skew = None
-
-        # self.clock_skew_strategy = clock_skew_strategy
 
     def active(self):
         with self.lock:
@@ -548,10 +501,8 @@ class Network(object):
                 # Ok, all done!
                 if d is not None:
                     d.callback(self)
-        def fail(reason):
-            d.errback(reason)
         ping.addCallback(success)
-        ping.addErrback(fail)
+        ping.addErrback(d.errback)
 
     def _update_exposed_metrics(self):
         with self.lock:

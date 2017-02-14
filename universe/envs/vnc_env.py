@@ -1,24 +1,21 @@
 import getpass
 import logging
 import os
-import socket
-import time
 import uuid
+
+import universe
+from gym.utils import reraise
+from universe import error, pyprofile, rewarder, spaces, twisty, vectorized, vncdriver
+from universe import remotes as remotes_module
+from universe.envs import diagnostics
+from universe.runtimes import registration
+from universe.vncdriver import libvnc_session
 
 # The Go driver is the most supported one. So long as the Go driver
 # turns out to be easy to install, we'll continue forcing the Go
 # driver here.
+# noinspection PyUnresolvedReferences
 import go_vncdriver
-
-from gym import scoreboard
-from gym.utils import reraise
-
-import universe
-from universe import error, remotes as remotes_module, pyprofile, rewarder, spaces, twisty, utils, vectorized, vncdriver
-from universe.envs import diagnostics
-from universe.remotes import healthcheck
-from universe.runtimes import registration
-from universe.vncdriver import libvnc_session
 
 logger = logging.getLogger(__name__)
 extra_logger = logging.getLogger('universe.extra.'+__name__)
@@ -108,6 +105,7 @@ class VNCEnv(vectorized.Env):
         'semantics.autoreset': True,
         'video.frames_per_second' : 60,
         'runtime.vectorized': True,
+        'configure.required': True,
     }
 
     def __init__(self, fps=None, probe_key=None):
@@ -129,6 +127,8 @@ class VNCEnv(vectorized.Env):
         self.rewarder_session = None
 
         self._send_actions_over_websockets = False
+        self._skip_network_calibration = False
+
 
     def _seed(self, seed):
         self._seed_value = seed
@@ -138,10 +138,11 @@ class VNCEnv(vectorized.Env):
                    client_id=None,
                    start_timeout=None, docker_image=None,
                    ignore_clock_skew=False, disable_action_probes=False,
-                   vnc_driver=None, vnc_kwargs={},
+                   vnc_driver=None, vnc_kwargs=None,
                    rewarder_driver=None,
                    replace_on_crash=False, allocate_sync=True,
                    observer=False, api_key=None,
+                   record=False,
     ):
         """Standard Gym hook to configure the environment.
 
@@ -186,10 +187,14 @@ class VNCEnv(vectorized.Env):
         if client_id is None:
             client_id = default_client_id()
 
+        if vnc_kwargs is None:
+            vnc_kwargs = {}
+
         self.remote_manager, self.n = remotes_module.build(
             client_id=client_id,
             remotes=remotes, runtime=runtime, start_timeout=start_timeout,
             api_key=api_key,
+            use_recorder_ports=record,
         )
         self.connection_names = [None] * self.n
         self.connection_labels = [None] * self.n
@@ -246,7 +251,7 @@ class VNCEnv(vectorized.Env):
             self._handle_connect()
 
     def connect(self, i, name, vnc_address, rewarder_address, vnc_password=None, rewarder_password=None):
-        logger.info('[%s] Connecting to environment: vnc://%s password=%s. Use the browser-based VNC client: http://%s/viewer/?password=%s', name, vnc_address, vnc_password, rewarder_address, vnc_password)
+        logger.info('[%s] Connecting to environment: vnc://%s password=%s. If desired, you can manually connect a VNC viewer, such as TurboVNC. Most environments provide a convenient in-browser VNC client: http://%s/viewer/?password=%s', name, vnc_address, vnc_password, rewarder_address, vnc_password)
 
         extra_logger.info('[%s] Connecting to environment details: vnc_address=%s vnc_password=%s rewarder_address=%s rewarder_password=%s', name, vnc_address, vnc_password, rewarder_address, rewarder_password)
         self.connection_names[i] = name
@@ -291,7 +296,8 @@ class VNCEnv(vectorized.Env):
                 password=rewarder_password,
                 label=self.connection_labels[i],
                 start_timeout=self.remote_manager.start_timeout,
-                observer=self._observer
+                observer=self._observer,
+                skip_network_calibration=self._skip_network_calibration
             )
         else:
             network = None
@@ -327,6 +333,8 @@ class VNCEnv(vectorized.Env):
 
         if self.rewarder_session:
             self.rewarder_session.reset()
+        else:
+            logger.info("No rewarder session exists, so cannot send a reset via the rewarder channel")
         self._reset_mask()
         return [None] * self.n
 
@@ -478,6 +486,8 @@ class VNCEnv(vectorized.Env):
                 info_n[i]['error'] = 'Rewarder session failed: {}'.format(err)
             else:
                 info_n[i]['error'] = 'VNC session failed: {}'.format(vnc_err)
+
+            extra_logger.info('[%s] %s', self.connection_names[i], info_n[i]['error'])
 
             if self.allow_reconnect:
                 logger.info('[%s] Making a call to the allocator to replace crashed index: %s', self.connection_names[i], info_n[i]['error'])

@@ -26,6 +26,8 @@ class RewarderClient(websocket.WebSocketClientProtocol):
         self._reset = None
         self._initial_reset = False
 
+        self._connection_result = defer.Deferred()
+
     def send_reset(self, env_id, seed, fps, episode_id):
         self._initial_reset = True
         self._reset = {
@@ -50,10 +52,12 @@ class RewarderClient(websocket.WebSocketClientProtocol):
 
         self.reward_buffer = self.factory.reward_buffer
 
-        self.factory.deferred.callback(self)
-        # Make sure we don't accidentally try to double call it
-        self.factory.deferred = None
+        assert not self._connection_result.called
+        self._connection_result.callback(self)
         self._connected = True
+
+    def waitForWebsocketConnection(self):
+        return self._connection_result
 
     def send(self, method, body, headers=None, expect_reply=False):
         if headers is None:
@@ -64,9 +68,7 @@ class RewarderClient(websocket.WebSocketClientProtocol):
                 error_message += ": {}".format(self._close_message)
             e = error.Error(error_message)
             if expect_reply:
-                d = defer.Deferred()
-                d.errback(e)
-                return d
+                return defer.fail(e)
             else:
                 raise e
 
@@ -196,9 +198,8 @@ class RewarderClient(websocket.WebSocketClientProtocol):
             return
 
         if not self._connected:
-            self.factory.deferred.errback(error.ConnectionError(reason))
-            # Make sure we don't accidentally try to double call it
-            self.factory.deferred = None
+            assert not self._connection_result.called
+            self._connection_result.errback(error.ConnectionError(reason))
             return
 
         if not self._closed:
@@ -207,13 +208,13 @@ class RewarderClient(websocket.WebSocketClientProtocol):
             # TODO: it's not an error if we requested it
             self.factory.record_error(reason)
         else:
-            reason = error.Error("Connection already closed: {}".format(reason))
+            reason = error.Error("We closed the connection: {}".format(reason))
 
         for request, d in self._requests.values():
             d.errback(reason)
 
+    def close(self, code=1000, reason=None):
         self._closed = True
-
-    def close(self):
-        self._closed = True
+        extra_logger.info('[%s] Client closing websocket connection because of call to close(code=%s, reason=%s)', self.factory.label, code, reason)
+        self.sendClose(code, reason)
         self.transport.loseConnection()

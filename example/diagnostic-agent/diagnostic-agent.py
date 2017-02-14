@@ -1,22 +1,22 @@
 #!/usr/bin/env python
 import argparse
 import logging
-import numpy as np
-import os
-import six
-import sys
-import threading
 import time
-import traceback
 
 import gym
+import numpy as np
 import universe
 from universe import pyprofile, wrappers, spaces
+from gym import wrappers as gym_wrappers
 
 # if not os.getenv("PYPROFILE_FREQUENCY"):
 #     pyprofile.profile.print_frequency = 5
+from universe import vectorized
 
 logger = logging.getLogger()
+
+CHROME_X_OFFSET = 18
+CHROME_Y_OFFSET = 84
 
 class NoopSpace(gym.Space):
     """ Null action space """
@@ -61,7 +61,7 @@ if __name__ == '__main__':
     universe.configure_logging()
 
     # Actions this agent will take, 'random' is the default
-    action_choices = ['random', 'noop', 'forward']
+    action_choices = ['random', 'noop', 'forward', 'click']
 
     parser = argparse.ArgumentParser(description=None)
     parser.add_argument('-e', '--env_id', default='gym-core.Pong-v3', help='Which environment to run on.')
@@ -75,6 +75,8 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--reuse', default=False, action='store_true', help='Reuse existing Docker container if present, and leave this one running after (only for "-r n")')
     parser.add_argument('-f', '--fps', default=60., type=float, help='Desired frames per second')
     parser.add_argument('-N', '--max-steps', type=int, default=10**7, help='Maximum number of steps to take')
+    parser.add_argument('-E', '--max-episodes', type=int, default=10**7, help='Maximum number of episodes')
+    parser.add_argument('-T', '--start-timeout', type=int, default=None, help='Rewarder session connection timeout (seconds)')
     args = parser.parse_args()
 
     logging.getLogger('gym').setLevel(logging.NOTSET)
@@ -95,11 +97,32 @@ if __name__ == '__main__':
         # translator. Everything else probably wants a SafeActionSpace
         # wrapper to shield them from random-agent clicking around
         # everywhere.
-        env = wrappers.SafeActionSpace(env)
+        env = wrappers.experimental.SafeActionSpace(env)
     else:
         # Only gym-core are seedable
         env.seed([0])
     env = wrappers.Logger(env)
+
+    if args.monitor:
+        env = wrappers.Monitor(env, '/tmp/vnc_random_agent', force=True)
+
+    if args.actions == 'random':
+        action_space = env.action_space
+    elif args.actions == 'noop':
+        action_space = NoopSpace()
+    elif args.actions == 'forward':
+        action_space = ForwardSpace()
+    elif args.actions == 'click':
+        spec = universe.runtime_spec('flashgames').server_registry[args.env_id]
+        height = spec["height"]
+        width = spec["width"]
+        noclick_regions = [r['coordinates'] for r in spec['regions'] if r['type'] == 'noclick'] if spec.get('regions') else []
+        active_region = (CHROME_X_OFFSET, CHROME_Y_OFFSET, CHROME_X_OFFSET + width, CHROME_Y_OFFSET + height)
+        env = wrappers.SoftmaxClickMouse(env, active_region=active_region, noclick_regions=noclick_regions)
+        action_space = env.action_space
+    else:
+        logger.error("Invalid action choice: {}".format(args.actions))
+        exit(1)
 
     env.configure(
         fps=args.fps,
@@ -107,6 +130,7 @@ if __name__ == '__main__':
         # ignore_clock_skew=True,
         remotes=args.remote,
         client_id=args.client_id,
+        start_timeout=args.start_timeout,
 
         # remotes=remote, docker_image=args.docker_image, reuse=args.reuse, ignore_clock_skew=True,
         # vnc_session_driver='go', vnc_session_kwargs={
@@ -119,19 +143,6 @@ if __name__ == '__main__':
         },
     )
 
-    if args.monitor:
-        env.monitor.start('/tmp/vnc_random_agent', force=True, video_callable=lambda i: True)
-
-    if args.actions == 'random':
-        action_space = env.action_space
-    elif args.actions == 'noop':
-        action_space = NoopSpace()
-    elif args.actions == 'forward':
-        action_space = ForwardSpace()
-    else:
-        logger.error("Invalid action choice: {}".format(args.actions))
-        exit(1)
-
     agent = RandomAgent(action_space, n=env.n, vectorized=env.metadata['runtime.vectorized'])
 
     render = not args.no_render
@@ -143,6 +154,8 @@ if __name__ == '__main__':
     observation_count = np.zeros(env.n)
     episode_length = np.zeros(env.n)
     episode_score = np.zeros(env.n)
+
+    episodes_completed = 0
 
     for i in range(args.max_steps):
         # print(observation_n)
@@ -188,6 +201,10 @@ if __name__ == '__main__':
         errored = [i for i, info_i in enumerate(info['n']) if 'error' in info_i]
         if errored:
             logger.info('had errored indexes: %s: %s', errored, info)
+
+        episodes_completed += len([d for d in done_n if d])
+        if episodes_completed >= args.max_episodes:
+            break
 
         # if info.get('n') and info['n'][0].get('env_status.instruction'):
         #     logger.info('received instruction = %s', info['n'][0]['env_status.instruction'])
